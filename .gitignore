@@ -1,0 +1,7 @@
+
+# mine
+__pycache__
+all_result_log*
+result
+wandb
+test*.sh
