@@ -253,6 +253,9 @@ class OurTrainer(Trainer):
         self._train_batch_size = batch_size
         # Data loader and number of training steps
         train_dataloader = self.get_train_dataloader()
+        
+        
+        resume_from_checkpoint = None # 强制拒绝 reload ckpt
 
         # MeZO added: Linear probing
         if self.args.linear_probing:
@@ -503,11 +506,21 @@ class OurTrainer(Trainer):
                     # AT THE VERY END!
                     _ = list(train_dataloader.sampler)
 
+
+        # 我们用来做早停的
+        self.total_steps = -1
+        self.eval_loss_history = []
+        self.tolerance = 0
+
         for epoch in range(epochs_trained, num_train_epochs):
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
                 train_dataloader.sampler.set_epoch(epoch)
             elif hasattr(train_dataloader, "dataset") and isinstance(train_dataloader.dataset, IterableDatasetShard):
                 train_dataloader.dataset.set_epoch(epoch)
+
+            if (self.tolerance > 5) and (len(self.eval_loss_history) > 1):
+                logger.info('Early stopping at step %d, recorded best eval loss %.4f' % (self.total_steps, min(self.eval_loss_history)))
+                break
 
             if is_torch_tpu_available():
                 parallel_loader = pl.ParallelLoader(train_dataloader, [args.device]).per_device_loader(args.device)
@@ -531,6 +544,7 @@ class OurTrainer(Trainer):
 
             step = -1
             for step, inputs in enumerate(epoch_iterator):
+                self.total_steps += 1
 
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
@@ -573,6 +587,20 @@ class OurTrainer(Trainer):
                     tr_loss += tr_loss_step
 
                 self.current_flos += float(self.floating_point_ops(inputs))
+
+                ########################################################################################################
+                if self.total_steps % 100 == 0:
+                    metrics = self.evaluate(ignore_keys=ignore_keys_for_eval)
+                    logger.info(metrics)
+                    self.eval_loss_history.append(metrics['eval_loss'])
+                    if metrics['eval_loss'] > min(self.eval_loss_history):
+                        self.tolerance += 1
+                        logger.info('Tolerance: %d at %d, recorded best eval loss %.4f' % (self.tolerance, self.total_steps, min(self.eval_loss_history)))
+                    else:
+                        logger.info('Tolerance back to %d at %d, recorded best eval loss %.4f' % (self.tolerance, self.total_steps, min(self.eval_loss_history)))
+                        self.tolerance = 0
+                logger.info('mylog, %d, %.4f, %.4f' % (self.total_steps, tr_loss_step, tr_loss))
+                ########################################################################################################
 
                 # Optimizer step for deepspeed must be called on every step regardless of the value of gradient_accumulation_steps
                 if self.deepspeed:
@@ -641,6 +669,7 @@ class OurTrainer(Trainer):
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
+                    self.control.should_save = False # don't save
                     self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
@@ -656,6 +685,7 @@ class OurTrainer(Trainer):
                 self.control.should_training_stop = True
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
+            self.control.should_save = False # don't save
             self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
 
             if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
