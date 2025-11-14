@@ -211,6 +211,7 @@ def get_sign(number):
     return int(sign)
 
 
+
 class OurTrainer(Trainer):
     from transformers.trainer_pt_utils import _get_learning_rate, log_metrics, metrics_format, save_metrics, save_state
 
@@ -588,19 +589,19 @@ class OurTrainer(Trainer):
 
                 self.current_flos += float(self.floating_point_ops(inputs))
 
-                ########################################################################################################
-                if self.total_steps % 100 == 0:
-                    metrics = self.evaluate(ignore_keys=ignore_keys_for_eval)
-                    logger.info(metrics)
-                    self.eval_loss_history.append(metrics['eval_loss'])
-                    if metrics['eval_loss'] > min(self.eval_loss_history):
-                        self.tolerance += 1
-                        logger.info('Tolerance: %d at %d, recorded best eval loss %.4f' % (self.tolerance, self.total_steps, min(self.eval_loss_history)))
-                    else:
-                        logger.info('Tolerance back to %d at %d, recorded best eval loss %.4f' % (self.tolerance, self.total_steps, min(self.eval_loss_history)))
-                        self.tolerance = 0
+                # ########################################################################################################
+                # if self.total_steps % 100 == 0:
+                #     metrics = self.evaluate(ignore_keys=ignore_keys_for_eval)
+                #     logger.info(metrics)
+                #     self.eval_loss_history.append(metrics['eval_loss'])
+                #     if metrics['eval_loss'] > min(self.eval_loss_history):
+                #         self.tolerance += 1
+                #         logger.info('Tolerance: %d at %d, recorded best eval loss %.4f' % (self.tolerance, self.total_steps, min(self.eval_loss_history)))
+                #     else:
+                #         logger.info('Tolerance back to %d at %d, recorded best eval loss %.4f' % (self.tolerance, self.total_steps, min(self.eval_loss_history)))
+                #         self.tolerance = 0
                 logger.info('mylog, %d, %.4f, %.4f' % (self.total_steps, tr_loss_step, tr_loss))
-                ########################################################################################################
+                # ########################################################################################################
 
                 # Optimizer step for deepspeed must be called on every step regardless of the value of gradient_accumulation_steps
                 if self.deepspeed:
@@ -669,7 +670,9 @@ class OurTrainer(Trainer):
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
-                    self.control.should_save = False # don't save
+                    # 251113 修改保存等控制逻辑
+                    # self.control.should_save = False # don't save
+                    
                     self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
@@ -685,7 +688,10 @@ class OurTrainer(Trainer):
                 self.control.should_training_stop = True
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
-            self.control.should_save = False # don't save
+            
+            # 251113 修改保存等控制逻辑
+            # self.control.should_save = False # don't save
+            
             self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
 
             if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
@@ -713,6 +719,10 @@ class OurTrainer(Trainer):
                 dist.barrier()
             elif is_sagemaker_mp_enabled():
                 smp.barrier()
+            
+            # 251114 添加日志
+            logger.info(f"Loading best model from {self.state.best_model_checkpoint} (score: {self.state.best_metric}).")
+            # ====================================================
 
             self._load_best_model()
 
@@ -731,15 +741,17 @@ class OurTrainer(Trainer):
 
         self.log(metrics)
 
-        run_dir = self._get_output_dir(trial)
-        checkpoints_sorted = self._sorted_checkpoints(use_mtime=False, output_dir=run_dir)
+        # 251114 我们已经控制了只保存一个best，所以没必要再做删除逻辑
+        # run_dir = self._get_output_dir(trial)
+        # checkpoints_sorted = self._sorted_checkpoints(use_mtime=False, output_dir=run_dir)
 
-        # Delete the last checkpoint when save_total_limit=1 if it's different from the best checkpoint.
-        if self.state.best_model_checkpoint is not None and self.args.save_total_limit == 1:
-            for checkpoint in checkpoints_sorted:
-                if checkpoint != self.state.best_model_checkpoint:
-                    logger.info(f"Deleting older checkpoint [{checkpoint}] due to args.save_total_limit")
-                    shutil.rmtree(checkpoint)
+        # # Delete the last checkpoint when save_total_limit=1 if it's different from the best checkpoint.
+        # if self.state.best_model_checkpoint is not None and self.args.save_total_limit == 1:
+        #     for checkpoint in checkpoints_sorted:
+        #         if checkpoint != self.state.best_model_checkpoint:
+        #             logger.info(f"Deleting older checkpoint [{checkpoint}] due to args.save_total_limit")
+        #             shutil.rmtree(checkpoint)
+        # ====================================================
 
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
 
@@ -954,3 +966,112 @@ class OurTrainer(Trainer):
         # Push to the Hub when `save_model` is called by the user.
         if self.args.push_to_hub and not _internal_call:
             self.push_to_hub(commit_message="Model save")
+
+    def _save_checkpoint(self, model, trial, metrics=None):
+        # In all cases, including ddp/dp/deepspeed, self.model is always a reference to the model we
+        # want to save except FullyShardedDDP.
+        # assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
+
+        # Save model checkpoint
+        # == 251114 修改best folder路径，覆盖保存在一个地方，而不是全部step都保存 ==
+        # checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-best"
+        # ==============================================================
+        
+        if self.hp_search_backend is None and trial is None:
+            self.store_flos()
+
+        run_dir = self._get_output_dir(trial=trial)
+        output_dir = os.path.join(run_dir, checkpoint_folder)
+        self.save_model(output_dir, _internal_call=True)
+        if self.deepspeed:
+            # under zero3 model file itself doesn't get saved since it's bogus! Unless deepspeed
+            # config `stage3_gather_16bit_weights_on_model_save` is True
+            self.deepspeed.save_checkpoint(output_dir)
+
+        # Save optimizer and scheduler
+        if self.sharded_ddp == ShardedDDPOption.SIMPLE:
+            self.optimizer.consolidate_state_dict()
+
+        if is_torch_tpu_available():
+            xm.rendezvous("saving_optimizer_states")
+            xm.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
+            with warnings.catch_warnings(record=True) as caught_warnings:
+                xm.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
+                reissue_pt_warnings(caught_warnings)
+        elif is_sagemaker_mp_enabled():
+            opt_state_dict = self.optimizer.local_state_dict(gather_if_shard=False)
+            smp.barrier()
+            if smp.rdp_rank() == 0 or smp.state.cfg.shard_optimizer_state:
+                smp.save(
+                    opt_state_dict,
+                    os.path.join(output_dir, OPTIMIZER_NAME),
+                    partial=True,
+                    v3=smp.state.cfg.shard_optimizer_state,
+                )
+            if self.args.should_save:
+                with warnings.catch_warnings(record=True) as caught_warnings:
+                    torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
+                reissue_pt_warnings(caught_warnings)
+                if self.do_grad_scaling:
+                    torch.save(self.scaler.state_dict(), os.path.join(output_dir, SCALER_NAME))
+        elif self.args.should_save and not self.deepspeed:
+            # deepspeed.save_checkpoint above saves model/optim/sched
+            torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
+            with warnings.catch_warnings(record=True) as caught_warnings:
+                torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
+            reissue_pt_warnings(caught_warnings)
+            if self.do_grad_scaling:
+                torch.save(self.scaler.state_dict(), os.path.join(output_dir, SCALER_NAME))
+
+        # Determine the new best metric / best model checkpoint
+        if metrics is not None and self.args.metric_for_best_model is not None:
+            metric_to_check = self.args.metric_for_best_model
+            if not metric_to_check.startswith("eval_"):
+                metric_to_check = f"eval_{metric_to_check}"
+            metric_value = metrics[metric_to_check]
+
+            operator = np.greater if self.args.greater_is_better else np.less
+            if (
+                self.state.best_metric is None
+                or self.state.best_model_checkpoint is None
+                or operator(metric_value, self.state.best_metric)
+            ):
+                self.state.best_metric = metric_value
+                self.state.best_model_checkpoint = output_dir
+
+        # Save the Trainer state
+        if self.args.should_save:
+            self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+
+        # Save RNG state in non-distributed training
+        rng_states = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "cpu": torch.random.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            if self.args.local_rank == -1:
+                # In non distributed, we save the global CUDA RNG state (will take care of DataParallel)
+                rng_states["cuda"] = torch.cuda.random.get_rng_state_all()
+            else:
+                rng_states["cuda"] = torch.cuda.random.get_rng_state()
+
+        if is_torch_tpu_available():
+            rng_states["xla"] = xm.get_rng_state()
+
+        # A process can arrive here before the process 0 has a chance to save the model, in which case output_dir may
+        # not yet exist.
+        os.makedirs(output_dir, exist_ok=True)
+
+        if self.args.world_size <= 1:
+            torch.save(rng_states, os.path.join(output_dir, "rng_state.pth"))
+        else:
+            torch.save(rng_states, os.path.join(output_dir, f"rng_state_{self.args.process_index}.pth"))
+
+        if self.args.push_to_hub:
+            self._push_from_checkpoint(output_dir)
+
+        # Maybe delete some older checkpoints.
+        if self.args.should_save:
+            self._rotate_checkpoints(use_mtime=True, output_dir=run_dir)
